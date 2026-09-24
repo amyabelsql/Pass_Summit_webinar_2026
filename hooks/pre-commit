@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# pre-commit hook: block commits that introduce a SQL DELETE statement
+# without an accompanying WHERE clause.
+#
+# Scope: checks the staged (index) content of files matching *.sql, *.ddl,
+# *.dml (case-insensitive). Only newly added/modified lines are inspected,
+# but the WHERE check is done against the full staged statement so that
+# multi-line DELETE statements are handled correctly.
+#
+# To enable this hook, run once from the repo root:
+#   git config core.hooksPath hooks
+
+set -euo pipefail
+
+# File patterns to scan (extend as needed).
+FILE_PATTERN='\.(sql|ddl|dml)$'
+
+# Get staged files that are added or modified, matching the pattern above.
+staged_files=$(git diff --cached --name-only --diff-filter=ACM | grep -Ei "$FILE_PATTERN" || true)
+
+if [ -z "$staged_files" ]; then
+  exit 0
+fi
+
+violations_found=0
+
+check_file() {
+  local file="$1"
+  # Staged (index) content, not working tree content.
+  local content
+  content=$(git show ":$file" 2>/dev/null || true)
+
+  if [ -z "$content" ]; then
+    return 0
+  fi
+
+  # Strip SQL line comments (-- ...) and block comments (/* ... */),
+  # then split into individual statements on ';'.
+  local cleaned
+  cleaned=$(printf '%s\n' "$content" \
+    | sed -E 's/--.*$//' \
+    | perl -0777 -pe 's{/\*.*?\*/}{}gs' 2>/dev/null) || cleaned="$content"
+
+  # Split statements on semicolons; examine each one.
+  local stmt_num=0
+  while IFS= read -r -d ';' stmt || [ -n "$stmt" ]; do
+    stmt_num=$((stmt_num + 1))
+    [ -z "$(echo "$stmt" | tr -d '[:space:]')" ] && continue
+
+    # Normalize whitespace for matching.
+    local norm
+    norm=$(echo "$stmt" | tr '\n\t' '  ' | tr -s ' ')
+
+    # Match a DELETE statement (with or without an explicit FROM).
+    if echo "$norm" | grep -qiE '^[[:space:]]*DELETE([[:space:]]+FROM)?[[:space:]]+[^[:space:]]+'; then
+      if ! echo "$norm" | grep -qiE '[[:space:]]WHERE[[:space:]]'; then
+        echo "  ✖ $file: DELETE statement without WHERE clause:"
+        echo "      $(echo "$norm" | sed -E 's/^[[:space:]]+//' | cut -c1-160)"
+        violations_found=1
+      fi
+    fi
+  done <<< "$cleaned;"
+}
+
+echo "Checking staged SQL files for unsafe DELETE statements..."
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  check_file "$file"
+done <<< "$staged_files"
+
+if [ "$violations_found" -ne 0 ]; then
+  echo ""
+  echo "Commit blocked: DELETE statement(s) without a WHERE clause were found."
+  echo "Add a WHERE clause, or if this is intentional, bypass with 'git commit --no-verify'."
+  exit 1
+fi
+
+exit 0
